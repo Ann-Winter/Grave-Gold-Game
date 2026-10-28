@@ -1,0 +1,2344 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>墓中金币 · 西部像素对决</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; }
+  body {
+    margin: 0; overflow: hidden; background: #030303;
+    background-image: radial-gradient(circle at 50% 42%, #18140d 0%, #080706 48%, #010101 100%);
+    display: grid; place-items: center;
+    font-family: "Courier New", Consolas, monospace;
+  }
+  #stage {
+    position: relative;
+    width: min(96vw, calc(92vh * 16 / 9), 1440px);
+    aspect-ratio: 16 / 9;
+    border: 1px solid #2d2415;
+    box-shadow: 0 0 0 4px #080705, 0 18px 70px rgba(0,0,0,.92), 0 0 42px rgba(169,127,48,.08);
+    background: #000;
+    overflow: hidden;
+  }
+  #stage::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 2;
+    background: repeating-linear-gradient(to bottom, rgba(255,255,255,.018) 0 1px, rgba(0,0,0,.055) 1px 3px);
+    mix-blend-mode: overlay;
+  }
+  canvas {
+    display: block; width: 100%; height: 100%;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    outline: none; cursor: crosshair; touch-action: none;
+  }
+</style>
+</head>
+<body>
+<main id="stage"><canvas id="game" width="960" height="540" aria-label="墓中金币 2D 像素西部对决游戏"></canvas></main>
+<script>
+(() => {
+  'use strict';
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+  const W = 960, H = 540, HUD_H = 56, VH = H - HUD_H;
+  const FONT = '"Courier New", "Microsoft YaHei", "Noto Sans Mono CJK SC", monospace';
+  ctx.imageSmoothingEnabled = false;
+
+  const C = {
+    black: '#060605',
+    ink: '#0b0b09',
+    night: '#121210',
+    charcoal: '#191816',
+    smoke: '#25221e',
+    ash: '#3b3831',
+    dust: '#575044',
+    bone: '#d8cdb3',
+    pale: '#f0e6cb',
+    gold: '#d0a43c',
+    goldBright: '#f2ca60',
+    goldDark: '#6e531d',
+    rust: '#6f3d2a',
+    red: '#b83a31',
+    redDark: '#5d1a17',
+    white: '#fff8e8'
+  };
+
+  const LEVELS = [
+    { no: 1, name: '沙漠奔跑', loc: '亚利桑那·赤沙荒原', maxHp: 3 },
+    { no: 2, name: '南北战争·石桥战场', loc: '弗吉尼亚·石桥', maxHp: 3 },
+    { no: 3, name: '墓园·正午对决', loc: '萨德希尔公墓', maxHp: 2 }
+  ];
+
+  const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const randInt = (a, b) => Math.floor(rand(a, b + 1));
+  const sign = v => v < 0 ? -1 : 1;
+  const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+
+  function rect(x, y, w, h, color) {
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.round(x), Math.round(y), Math.round(w), Math.round(h));
+  }
+
+  function text(str, x, y, size, color, align = 'left', weight = 'bold', shadow = true) {
+    ctx.font = `${weight} ${size}px ${FONT}`;
+    ctx.textAlign = align;
+    ctx.textBaseline = 'alphabetic';
+    if (shadow) {
+      ctx.fillStyle = 'rgba(0,0,0,.82)';
+      ctx.fillText(str, Math.round(x) + 2, Math.round(y) + 2);
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(str, Math.round(x), Math.round(y));
+  }
+
+  function pixelCircle(cx, cy, r, color, step = 4) {
+    ctx.fillStyle = color;
+    for (let y = -r; y < r; y += step) {
+      const half = Math.sqrt(Math.max(0, r * r - y * y));
+      ctx.fillRect(Math.round(cx - half), Math.round(cy + y), Math.round(half * 2), step);
+    }
+  }
+
+  function drawHeart(x, y, filled) {
+    const c = filled ? C.bone : '#302b23';
+    rect(x + 1, y + 1, 4, 3, c);
+    rect(x + 8, y + 1, 4, 3, c);
+    rect(x, y + 3, 13, 4, c);
+    rect(x + 2, y + 7, 9, 3, c);
+    rect(x + 4, y + 10, 5, 2, c);
+    if (filled) rect(x + 2, y + 3, 2, 2, '#f5edd8');
+  }
+
+  function aabb(x, y, w, h) { return { x, y, w, h }; }
+
+  function fmt(n, digits = 1) { return n.toFixed(digits); }
+
+  // ---------- 音效：WebAudio，失败则静默 ----------
+  const Sfx = {
+    ac: null,
+    master: null,
+    muted: false,
+    init() {
+      if (this.ac) {
+        if (this.ac.state === 'suspended') this.ac.resume().catch(() => {});
+        return;
+      }
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return;
+        this.ac = new AC();
+        this.master = this.ac.createGain();
+        this.master.gain.value = 0.2;
+        this.master.connect(this.ac.destination);
+      } catch (e) {
+        this.ac = null;
+        this.master = null;
+      }
+    },
+    tone(freq, dur, type = 'square', vol = 0.18, slide = 0, delay = 0) {
+      if (!this.ac || this.muted) return;
+      try {
+        const t0 = this.ac.currentTime + delay;
+        const osc = this.ac.createOscillator();
+        const gain = this.ac.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(Math.max(20, freq), t0);
+        if (slide) {
+          osc.frequency.exponentialRampToValueAtTime(Math.max(22, freq + slide), t0 + dur);
+        }
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, vol), t0 + 0.008);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+        osc.connect(gain);
+        gain.connect(this.master);
+        osc.start(t0);
+        osc.stop(t0 + dur + 0.025);
+      } catch (e) {}
+    },
+    toggle() {
+      this.init();
+      this.muted = !this.muted;
+      if (this.master) this.master.gain.value = this.muted ? 0 : 0.2;
+      if (!this.muted) this.tone(520, 0.06, 'square', 0.14, 160);
+      return !this.muted;
+    },
+    jump() { this.tone(310, 0.1, 'square', 0.15, 230); },
+    land() { this.tone(100, 0.05, 'square', 0.08, -30); },
+    hurt() { this.tone(155, 0.24, 'sawtooth', 0.3, -110); this.tone(75, 0.2, 'square', 0.16, -30, 0.02); },
+    pickup() { this.tone(440, 0.07, 'square', 0.14, 120); this.tone(660, 0.1, 'square', 0.12, 0, 0.07); },
+    place() { this.tone(220, 0.09, 'square', 0.16, -70); this.tone(180, 0.08, 'square', 0.12, -40, 0.08); },
+    warn() { this.tone(128, 0.09, 'square', 0.1, -18); this.tone(108, 0.09, 'square', 0.08, -10, 0.11); },
+    boom() {
+      this.tone(92, 0.62, 'sawtooth', 0.4, -60);
+      this.tone(54, 0.48, 'square', 0.28, -22, 0.03);
+      this.tone(180, 0.15, 'sawtooth', 0.12, -120, 0.01);
+    },
+    shoot() {
+      this.tone(920, 0.055, 'square', 0.2, -720);
+      this.tone(180, 0.09, 'sawtooth', 0.18, -110, 0.015);
+    },
+    enemyShoot() {
+      this.tone(690, 0.06, 'sawtooth', 0.2, -520);
+      this.tone(120, 0.11, 'square', 0.13, -60, 0.015);
+    },
+    signal() { this.tone(880, 0.09, 'square', 0.16, 60); this.tone(1320, 0.13, 'square', 0.14, 0, 0.08); },
+    coin() { this.tone(1180, 0.05, 'square', 0.07, 220); this.tone(1640, 0.065, 'square', 0.055, 0, 0.045); },
+    clear() { [392, 523, 659, 784].forEach((f, i) => this.tone(f, 0.16, 'square', 0.13, 0, i * 0.1)); },
+    death() { [240, 190, 145, 90].forEach((f, i) => this.tone(f, 0.22, 'sawtooth', 0.14, -35, i * 0.12)); },
+    win() { [392, 523, 659, 784, 1046, 784, 1046].forEach((f, i) => this.tone(f, 0.2, 'square', 0.14, 0, i * 0.12)); },
+    start() { this.tone(196, 0.09, 'square', 0.13, 80); this.tone(392, 0.12, 'square', 0.12, 0, 0.09); }
+  };
+
+  // ---------- 输入 ----------
+  const KEYMAP = {
+    KeyA: 'left', ArrowLeft: 'left',
+    KeyD: 'right', ArrowRight: 'right',
+    KeyW: 'up', ArrowUp: 'up',
+    Space: 'space', Enter: 'space',
+    KeyE: 'interact', KeyR: 'restart', KeyM: 'mute'
+  };
+  const Input = {
+    down: new Set(),
+    pressed: new Set(),
+    isDown(a) { return this.down.has(a); },
+    hit(a) { return this.pressed.has(a); },
+    clear() { this.pressed.clear(); }
+  };
+
+  window.addEventListener('keydown', e => {
+    const a = KEYMAP[e.code];
+    if (!a) return;
+    e.preventDefault();
+    Sfx.init();
+    if (!e.repeat) Input.pressed.add(a);
+    Input.down.add(a);
+  }, { passive: false });
+
+  window.addEventListener('keyup', e => {
+    const a = KEYMAP[e.code];
+    if (a) Input.down.delete(a);
+  });
+
+  window.addEventListener('blur', () => {
+    Input.down.clear();
+    Input.pressed.clear();
+  });
+
+  canvas.addEventListener('pointerdown', () => {
+    canvas.focus();
+    Sfx.init();
+    Input.pressed.add('space');
+  });
+
+  // ---------- 全局状态 ----------
+  const G = {
+    state: 'title',
+    level: 1,
+    time: 0,
+    stateTime: 0,
+    shake: 0,
+    flash: 0,
+    flashColor: '255,245,220',
+    particles: [],
+    coins: [],
+    coinAcc: 0,
+    coinSoundT: 0,
+    toast: '',
+    toastT: 0,
+    deadReason: '',
+    clearTitle: '',
+    clearSub: ''
+  };
+  let level = null;
+
+  function setToast(msg, time = 1.8) {
+    G.toast = msg;
+    G.toastT = time;
+  }
+
+  function meta() { return LEVELS[G.level - 1] || LEVELS[0]; }
+
+  // ---------- 粒子 ----------
+  function addParticles(x, y, color, count, speed = 100, life = 0.6, size = 3, gravity = 380) {
+    for (let i = 0; i < count; i++) {
+      const a = rand(0, Math.PI * 2);
+      const s = rand(speed * 0.25, speed);
+      G.particles.push({
+        x, y,
+        vx: Math.cos(a) * s,
+        vy: Math.sin(a) * s - rand(0, speed * 0.4),
+        life: rand(life * 0.55, life),
+        maxLife: life,
+        size: rand(1, size + 1),
+        color,
+        gravity
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (let i = G.particles.length - 1; i >= 0; i--) {
+      const p = G.particles[i];
+      p.life -= dt;
+      if (p.life <= 0) { G.particles.splice(i, 1); continue; }
+      p.vy += p.gravity * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.vx *= 0.99;
+      if (p.y > VH + 30) G.particles.splice(i, 1);
+    }
+  }
+
+  function drawParticles() {
+    for (const p of G.particles) {
+      const a = clamp(p.life / p.maxLife, 0, 1);
+      ctx.globalAlpha = a;
+      rect(p.x, p.y, p.size, p.size, p.color);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function startLevel(n) {
+    n = clamp(n, 1, 3);
+    G.level = n;
+    G.state = 'play';
+    G.stateTime = 0;
+    G.shake = 0;
+    G.flash = 0;
+    G.particles = [];
+    G.toast = '';
+    G.toastT = 0;
+    Sfx.init();
+    Sfx.start();
+    if (n === 1) level = createLevel1();
+    else if (n === 2) level = createLevel2();
+    else level = createLevel3();
+  }
+
+  function restartLevel() {
+    startLevel(G.level);
+  }
+
+  function completeLevel(title, sub) {
+    if (G.state !== 'play') return;
+    G.state = 'levelclear';
+    G.stateTime = 0;
+    G.clearTitle = title;
+    G.clearSub = sub;
+    G.shake = 0;
+    Sfx.clear();
+  }
+
+  function killPlayer(reason) {
+    if (G.state !== 'play') return;
+    G.state = 'dead';
+    G.stateTime = 0;
+    G.deadReason = reason;
+    G.shake = 14;
+    G.flash = 0.3;
+    G.flashColor = '255,235,205';
+    const px = level ? (level.px || level.playerX || W / 2) : W / 2;
+    const py = level ? (level.py || level.groundY || VH / 2) - 40 : VH / 2;
+    addParticles(px, py, C.gold, 12, 170, 0.8, 3, 300);
+    Sfx.death();
+  }
+
+  function triggerWin() {
+    G.state = 'win';
+    G.stateTime = 0;
+    G.coins = [];
+    G.coinAcc = 0;
+    G.coinSoundT = 0;
+    G.shake = 8;
+    G.flash = 0.22;
+    G.flashColor = '246,205,104';
+    addParticles(W / 2, 240, C.goldBright, 34, 230, 1.2, 4, 220);
+    Sfx.win();
+  }
+
+  function nextLevel() {
+    if (G.level < 3) startLevel(G.level + 1);
+    else triggerWin();
+  }
+
+  // ---------- 主循环 ----------
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    Input.clear();
+    requestAnimationFrame(loop);
+  }
+
+  function update(dt) {
+    G.time += dt;
+    G.stateTime += dt;
+
+    if (Input.hit('mute')) {
+      const on = Sfx.toggle();
+      setToast(on ? '音效：开启' : '音效：静音', 1.1);
+    }
+
+    if (G.state === 'title') {
+      if (Input.hit('space') || Input.hit('interact')) startLevel(1);
+    } else if (G.state === 'play') {
+      if (Input.hit('restart')) {
+        restartLevel();
+      } else if (level) {
+        level.update(dt);
+      }
+    } else if (G.state === 'dead') {
+      if (Input.hit('restart') || Input.hit('space')) restartLevel();
+    } else if (G.state === 'levelclear') {
+      if (Input.hit('space')) nextLevel();
+    } else if (G.state === 'win') {
+      updateCoins(dt);
+      if (Input.hit('restart')) {
+        startLevel(1);
+      } else if (Input.hit('space')) {
+        G.state = 'title';
+        G.stateTime = 0;
+        G.level = 1;
+        level = null;
+        G.coins = [];
+      }
+    }
+
+    updateParticles(dt);
+    G.shake = Math.max(0, G.shake - dt * 36);
+    G.flash = Math.max(0, G.flash - dt * 2.6);
+    G.toastT = Math.max(0, G.toastT - dt);
+  }
+
+  function updateCoins(dt) {
+    G.coinAcc += dt;
+    while (G.coinAcc > 0.035) {
+      G.coinAcc -= 0.035;
+      G.coins.push({
+        x: rand(10, W - 10),
+        y: rand(-90, -8),
+        vy: rand(90, 220),
+        sway: rand(4, 20),
+        phase: rand(0, Math.PI * 2),
+        spin: rand(0, Math.PI * 2),
+        spinSpd: rand(3, 9),
+        w: rand(6, 11),
+        h: rand(9, 14)
+      });
+    }
+    for (let i = G.coins.length - 1; i >= 0; i--) {
+      const c = G.coins[i];
+      c.spin += c.spinSpd * dt;
+      c.y += c.vy * dt;
+      c.x += Math.sin(G.time * 2.3 + c.phase) * c.sway * dt;
+      if (c.y > VH + 20) G.coins.splice(i, 1);
+    }
+    G.coinSoundT -= dt;
+    if (G.coinSoundT <= 0 && G.coins.length > 0) {
+      G.coinSoundT = 0.26;
+      Sfx.coin();
+    }
+  }
+
+  function drawCoins() {
+    for (const c of G.coins) {
+      const sx = Math.max(0.16, Math.abs(Math.cos(c.spin)));
+      const cw = c.w * sx;
+      ctx.globalAlpha = 0.95;
+      rect(c.x - cw / 2, c.y, cw, c.h, C.gold);
+      rect(c.x - cw / 2 + 1, c.y + 1, Math.max(1, cw * 0.32), c.h - 2, C.goldBright);
+      rect(c.x - cw / 2, c.y, cw, 1, '#fff0b0');
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  // ---------- 像素人物 ----------
+  function drawHero(cx, footY, facing, t, opts = {}) {
+    const col = c => opts.tint || c;
+    const moving = !!opts.moving;
+    const gait = Math.sin(t * (moving ? 15 : 2.2));
+    const amp = moving ? 5 : 0.7;
+    const bob = moving ? Math.round(Math.abs(Math.sin(t * 15)) * 2) : 0;
+    const sway = Math.sin(t * (moving ? 10 : 3)) * (moving ? 2 : 0.7);
+
+    ctx.save();
+    ctx.globalAlpha = opts.alpha == null ? 1 : opts.alpha;
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillRect(Math.round(cx - 19), Math.round(footY - 2), 38, 5);
+
+    ctx.translate(Math.round(cx), Math.round(footY - bob));
+    ctx.scale(facing, 1);
+
+    // 背后的斗篷
+    rect(-19, -46, 8, 22, col('#0d0d0c'));
+    rect(-16 + sway, -44, 7, 19, col('#141311'));
+    rect(-13 + sway, -28, 5, 8, col('#0d0d0c'));
+    rect(-19, -43, 2, 17, col('#4a4438'));
+    rect(-23 + sway, -41, 5, 11, col('#24211c'));
+    rect(-21 + sway, -30, 3, 8, col('#25221d'));
+    rect(-26 + sway * 1.3, -30, 6, 4, col('#171612'));
+    rect(-24 + sway * 1.2, -27, 4, 3, col('#3a352b'));
+
+    // 后腿与前腿
+    const legA = Math.round(gait * amp);
+    const legB = -legA;
+    rect(-9 + legA, -25, 7, 20, col('#11110f'));
+    rect(-10 + legA, -7, 9, 7, col('#060605'));
+    rect(2 + legB, -25, 7, 20, col('#302d26'));
+    rect(3 + legB, -23, 2, 13, col('#484238'));
+    rect(1 + legB, -7, 10, 7, col('#080807'));
+    rect(2 + legB, -18, 2, 5, col('#3e392f'));
+
+    // 披风式外衣
+    rect(-11, -48, 22, 22, col('#24221e'));
+    rect(-9, -27, 18, 7, col('#1a1916'));
+    rect(-8, -22, 5, 4, col('#1a1916'));
+    rect(3, -22, 5, 4, col('#1a1916'));
+    rect(-11, -41, 3, 13, col('#34312a'));
+    rect(7, -41, 3, 11, col('#151412'));
+    rect(-10, -31, 20, 3, col('#0b0b0a'));
+    rect(4, -30, 4, 2, col(C.goldDark));
+
+    // 前臂、手与左轮
+    rect(-12, -44, 5, 13, col('#181712'));
+    rect(-13, -32, 5, 4, col('#2e2922'));
+    rect(8, -43, 6, 14, col('#2e2b25'));
+    rect(10, -31, 5, 4, col('#3b342a'));
+    if (opts.gun) {
+      rect(12, -47, 10, 3, col('#11110f'));
+      rect(19, -45, 4, 6, col('#292722'));
+      rect(14, -48, 3, 2, col(C.goldDark));
+      rect(23, -47, 7, 2, col('#0b0b0a'));
+    }
+    if (opts.carry) {
+      rect(12, -45, 4, 12, col('#25221c'));
+      rect(17, -45, 4, 12, col('#302c24'));
+      rect(15, -47, 2, 5, col(C.gold));
+      rect(14, -49, 5, 2, col(C.goldDark));
+    }
+
+    // 围巾与颈部
+    rect(-8, -53, 17, 5, col(C.gold));
+    rect(-9, -52, 3, 3, col(C.goldBright));
+    rect(-16 + sway, -51, 9, 3, col(C.goldDark));
+    rect(-22 + sway * 1.7, -48, 8, 2, col(C.gold));
+    rect(-7, -57, 14, 7, col('#2e2820'));
+
+    // 头部
+    rect(-7, -61, 14, 10, col('#3b3328'));
+    rect(-7, -61, 3, 8, col('#211d18'));
+    rect(3, -58, 4, 7, col('#493d2d'));
+    rect(4, -57, 2, 2, col(opts.tint || C.goldBright));
+    rect(-5, -54, 7, 2, col('#17130f'));
+
+    // 帽子
+    rect(-15, -66, 30, 4, col('#0b0b0a'));
+    rect(-12, -67, 25, 2, col('#302d26'));
+    rect(-8, -76, 17, 11, col('#12110f'));
+    rect(-6, -75, 12, 3, col('#28251f'));
+    rect(-8, -69, 17, 3, col(C.goldDark));
+    rect(-2, -75, 3, 2, col(C.gold));
+    rect(-16, -64, 6, 2, col('#222019'));
+
+    if (opts.carry) {
+      rect(10, -42, 2, 2, col(C.goldBright));
+    }
+    ctx.restore();
+  }
+
+  function drawAngel(cx, footY, t, opts = {}) {
+    const col = c => opts.tint || c;
+    const move = opts.hit ? Math.sin(t * 65) * 3 : 0;
+    const bob = Math.round(Math.sin(t * 2.1) * 0.7);
+    ctx.save();
+    ctx.globalAlpha = opts.alpha == null ? 1 : opts.alpha;
+    ctx.fillStyle = 'rgba(0,0,0,.55)';
+    ctx.fillRect(Math.round(cx - 20), Math.round(footY - 2), 40, 5);
+    ctx.translate(Math.round(cx + move), Math.round(footY - bob));
+    ctx.scale(-1, 1);
+
+    // 长外套后摆
+    rect(-15, -43, 9, 26, col('#151412'));
+    rect(-20, -34, 9, 17, col('#0e0e0d'));
+    rect(-12, -20, 5, 10, col('#0d0d0c'));
+
+    // 双腿与靴子
+    rect(-8, -20, 8, 16, col('#171612'));
+    rect(-9, -6, 10, 6, col('#080807'));
+    rect(2, -20, 8, 16, col('#211f19'));
+    rect(1, -6, 11, 6, col('#090908'));
+    rect(3, -12, 3, 5, col('#353028'));
+
+    // 马甲与衬衫
+    rect(-12, -49, 24, 29, col('#29251f'));
+    rect(-11, -36, 22, 8, col('#1c1a16'));
+    rect(-6, -50, 12, 21, col('#171511'));
+    rect(-5, -50, 10, 5, col('#a49a83'));
+    rect(-4, -49, 8, 16, col('#b9ae94'));
+    rect(-2, -47, 2, 2, col(C.gold));
+    rect(-2, -41, 2, 2, col(C.gold));
+    rect(-2, -35, 2, 2, col(C.gold));
+    rect(-13, -49, 4, 18, col('#393329'));
+
+    // 手臂与枪
+    rect(7, -44, 6, 16, col('#343028'));
+    rect(10, -31, 5, 4, col('#b4a78e'));
+    if (opts.gun) {
+      rect(12, -48, 13, 3, col('#171614'));
+      rect(20, -45, 4, 7, col('#2f2b24'));
+      rect(14, -49, 3, 2, col(C.goldDark));
+      rect(25, -47, 7, 2, col('#0d0d0c'));
+    }
+
+    // 头部
+    rect(-7, -61, 14, 11, col('#b4a78e'));
+    rect(-7, -61, 3, 10, col('#716754'));
+    rect(3, -57, 3, 3, col('#17130f'));
+    rect(3, -53, 4, 1, col('#5e5343'));
+    rect(-6, -52, 11, 3, col('#8d826e'));
+
+    // 白色宽檐帽
+    rect(-18, -66, 36, 4, col('#ddd4bd'));
+    rect(-15, -68, 30, 2, col('#f0e8d2'));
+    rect(-9, -78, 19, 12, col('#d6ccb3'));
+    rect(-7, -77, 14, 4, col('#eee5cc'));
+    rect(-9, -70, 19, 3, col('#171511'));
+    rect(-4, -69, 8, 2, col(C.goldDark));
+    rect(-13, -64, 9, 2, col('#f5edda'));
+
+    // 交叉弹药带
+    rect(-10, -45, 2, 15, col('#4f3f28'));
+    rect(6, -45, 2, 15, col('#4f3f28'));
+    rect(-7, -38, 2, 2, col(C.goldDark));
+    rect(-1, -44, 2, 2, col(C.goldDark));
+    rect(3, -36, 2, 2, col(C.goldDark));
+    ctx.restore();
+  }
+
+  // ---------- 场景零件 ----------
+  function drawDuneLayer(offset, baseY, amp, color, step = 12) {
+    const lambda = 245;
+    for (let x = -step; x < W + step; x += step) {
+      const wx = x + offset;
+      const top = baseY - (Math.sin((wx / lambda) * Math.PI * 2) * 0.5 + 0.5) * amp
+        - Math.sin(wx / 57) * 4;
+      rect(x, top, step + 1, VH - top, color);
+    }
+  }
+
+  function drawGroundTexture(scroll, groundY, colors = {}) {
+    const top = colors.top || '#3c3424';
+    const body = colors.body || '#191714';
+    const dark = colors.dark || '#100f0d';
+    const fleck = colors.fleck || '#3c372d';
+    rect(0, groundY, W, VH - groundY, body);
+    rect(0, groundY, W, 4, top);
+    rect(0, groundY + 4, W, 2, '#26221b');
+    rect(0, groundY + 22, W, 2, dark);
+    rect(0, groundY + 51, W, 1, '#29251e');
+    for (let i = 0; i < 44; i++) {
+      const x = ((i * 137 - scroll * 0.75) % (W + 100) + W + 100) % (W + 100) - 50;
+      const y = groundY + 8 + ((i * 53) % 62);
+      const w = 2 + (i % 5) * 2;
+      rect(x, y, w, 2, i % 3 === 0 ? fleck : dark);
+    }
+    for (let i = 0; i < 13; i++) {
+      const x = ((i * 251 - scroll * 1.2) % (W + 160) + W + 160) % (W + 160) - 80;
+      const y = groundY + 10 + (i * 31) % 50;
+      rect(x, y, 18 + (i % 4) * 8, 1, '#25221c');
+      rect(x + 8, y + 3, 9, 1, '#0d0c0a');
+    }
+  }
+
+  function drawTumbleweed(x, y, r, t, color = '#5d5545') {
+    ctx.save();
+    ctx.translate(Math.round(x), Math.round(y));
+    ctx.rotate(t * 2.2);
+    for (let i = 0; i < 9; i++) {
+      const a = (i / 9) * Math.PI * 2;
+      rect(Math.cos(a) * r - 1, Math.sin(a) * r * 0.72 - 1, 3, 3, color);
+      rect(Math.cos(a + 0.42) * r * 0.62, Math.sin(a + 0.42) * r * 0.46, 2, 2, '#3c372d');
+    }
+    ctx.restore();
+  }
+
+  function drawGrave(x, baseY, s, style, alpha = 1, glow = false) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(Math.round(x), Math.round(baseY));
+    ctx.scale(s, s);
+    if (style === 0) {
+      rect(-12, -5, 24, 5, '#0b0b0a');
+      ctx.fillStyle = '#141310';
+      ctx.beginPath();
+      ctx.moveTo(-9, 0); ctx.lineTo(-9, -28); ctx.lineTo(-5, -36);
+      ctx.lineTo(5, -36); ctx.lineTo(9, -28); ctx.lineTo(9, 0);
+      ctx.closePath(); ctx.fill();
+      rect(-5, -32, 3, 24, '#25231e');
+      rect(2, -21, 3, 2, '#38332a');
+      rect(-2, -13, 7, 2, '#0a0a09');
+      if (glow) rect(5, -21, 2, 2, C.goldDark);
+    } else if (style === 1) {
+      rect(-13, -5, 26, 5, '#0b0b0a');
+      rect(-3, -43, 6, 39, '#151410');
+      rect(-14, -34, 28, 6, '#151410');
+      rect(-3, -43, 2, 30, '#302c24');
+      rect(-14, -34, 20, 2, '#2a2720');
+      rect(-11, -26, 2, 2, '#3b362c');
+    } else {
+      rect(-11, -5, 22, 5, '#0b0b0a');
+      ctx.fillStyle = '#12110e';
+      ctx.beginPath();
+      ctx.moveTo(-7, 0); ctx.lineTo(-5, -36); ctx.lineTo(0, -43);
+      ctx.lineTo(5, -36); ctx.lineTo(7, 0);
+      ctx.closePath(); ctx.fill();
+      rect(-1, -37, 2, 27, '#24211b');
+      rect(-7, -23, 12, 2, '#0a0a09');
+      if (glow) rect(2, -17, 2, 2, C.gold);
+    }
+    ctx.restore();
+  }
+
+  function drawCemeterySilhouette(x, baseY, alpha) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    // 小教堂
+    rect(x + 96, baseY - 58, 44, 58, '#11100e');
+    ctx.fillStyle = '#11100e';
+    ctx.beginPath();
+    ctx.moveTo(x + 88, baseY - 58); ctx.lineTo(x + 118, baseY - 82);
+    ctx.lineTo(x + 148, baseY - 58); ctx.closePath(); ctx.fill();
+    rect(x + 113, baseY - 104, 8, 28, '#100f0d');
+    rect(x + 108, baseY - 99, 18, 4, '#100f0d');
+    rect(x + 112, baseY - 55, 5, 9, '#3a2d16');
+    rect(x + 127, baseY - 43, 4, 8, '#2c2414');
+    // 围栏与墓碑
+    for (let i = 0; i < 8; i++) {
+      const gx = x + 8 + i * 28;
+      drawGrave(gx, baseY, 0.55 + (i % 2) * 0.08, i % 3, alpha);
+    }
+    rect(x + 34, baseY - 39, 3, 39, '#0e0d0b');
+    rect(x + 20, baseY - 30, 31, 3, '#0e0d0b');
+    rect(x + 33, baseY - 39, 1, 26, '#2b2820');
+    // 枯树
+    rect(x + 230, baseY - 67, 5, 67, '#0d0c0a');
+    rect(x + 216, baseY - 58, 19, 3, '#0d0c0a');
+    rect(x + 233, baseY - 78, 3, 15, '#0d0c0a');
+    rect(x + 235, baseY - 75, 16, 2, '#0d0c0a');
+    rect(x + 204, baseY - 50, 13, 2, '#0d0c0a');
+    rect(x + 206, baseY - 50, 2, 12, '#0d0c0a');
+    ctx.restore();
+  }
+
+  function drawBracketPanel(x, y, w, h, border = C.goldDark, fill = 'rgba(6,6,5,.76)') {
+    rect(x, y, w, h, fill);
+    rect(x, y, w, 1, border);
+    rect(x, y + h - 1, w, 1, border);
+    rect(x, y, 1, h, border);
+    rect(x + w - 1, y, 1, h, border);
+    rect(x + 3, y + 3, 7, 1, C.gold);
+    rect(x + w - 10, y + h - 4, 7, 1, C.gold);
+  }
+
+  // ============================================================
+  // 第一关：沙漠奔跑
+  // ============================================================
+  function createLevel1() {
+    const groundY = 418;
+    const lv = {
+      hp: 3,
+      maxHp: 3,
+      px: 205,
+      py: groundY,
+      vy: 0,
+      grounded: true,
+      invuln: 0,
+      hitFlash: 0,
+      dist: 0,
+      target: 3000,
+      speed: 205,
+      runT: 0,
+      spawnT: 1.25,
+      dustT: 0,
+      tumbleT: 2.2,
+      obstacles: [],
+      tumble: [],
+      finished: false,
+
+      update(dt) {
+        if (this.finished) return;
+        this.runT += dt;
+        this.invuln = Math.max(0, this.invuln - dt);
+        this.hitFlash = Math.max(0, this.hitFlash - dt);
+        const p = clamp(this.dist / this.target, 0, 1);
+        this.speed = 205 + 100 * p;
+        this.dist += this.speed * dt;
+
+        let drift = 0;
+        if (Input.isDown('left')) drift -= 1;
+        if (Input.isDown('right')) drift += 1;
+        this.px = clamp(this.px + drift * 128 * dt, 122, 420);
+
+        if ((Input.hit('space') || Input.hit('up')) && this.grounded) {
+          this.vy = -478;
+          this.grounded = false;
+          Sfx.jump();
+          addParticles(this.px - 7, groundY - 2, '#6a5d47', 5, 60, 0.38, 2, 150);
+        }
+
+        if (!this.grounded) {
+          this.vy += 1200 * dt;
+          this.py += this.vy * dt;
+          if (this.py >= groundY) {
+            this.py = groundY;
+            this.vy = 0;
+            this.grounded = true;
+            Sfx.land();
+            addParticles(this.px, groundY - 2, '#554b3a', 5, 55, 0.34, 2, 120);
+          }
+        }
+
+        this.dustT -= dt;
+        if (this.dustT <= 0 && this.grounded) {
+          this.dustT = 0.11;
+          G.particles.push({
+            x: this.px - 13, y: groundY - rand(1, 4),
+            vx: rand(-55, -22), vy: rand(-28, -6),
+            life: rand(0.25, 0.5), maxLife: 0.5,
+            size: rand(1, 3), color: '#514838', gravity: -15
+          });
+        }
+
+        this.spawnT -= dt;
+        if (this.spawnT <= 0 && this.dist < this.target - 320) {
+          const roll = Math.random();
+          let type;
+          if (roll < 0.36) type = 0;
+          else if (roll < 0.7) type = 1;
+          else type = 2;
+          const data = type === 0
+            ? { w: 25, h: 52 }
+            : type === 1
+              ? { w: 34, h: 24 }
+              : { w: 56, h: 38 };
+          this.obstacles.push({
+            x: W + 50 + rand(0, 80),
+            type,
+            w: data.w,
+            h: data.h,
+            hit: false,
+            seed: Math.random()
+          });
+          const base = rand(0.8, 1.3) * (220 / this.speed);
+          this.spawnT = clamp(base, 0.55, 1.35);
+        }
+
+        for (let i = this.obstacles.length - 1; i >= 0; i--) {
+          const o = this.obstacles[i];
+          o.x -= this.speed * dt;
+          if (o.x < -100) this.obstacles.splice(i, 1);
+        }
+
+        this.tumbleT -= dt;
+        if (this.tumbleT <= 0) {
+          this.tumbleT = rand(2.8, 5.4);
+          this.tumble.push({
+            x: W + 30,
+            y: groundY - rand(13, 29),
+            r: rand(6, 12),
+            v: rand(20, 55)
+          });
+        }
+        for (let i = this.tumble.length - 1; i >= 0; i--) {
+          const tw = this.tumble[i];
+          tw.x -= (this.speed * 0.28 + tw.v) * dt;
+          tw.y += Math.sin(G.time * 5 + i) * 10 * dt;
+          if (tw.x < -40) this.tumble.splice(i, 1);
+        }
+
+        const box = {
+          x: this.px - 11,
+          y: this.py - 58,
+          w: 22,
+          h: 58
+        };
+        for (const o of this.obstacles) {
+          if (o.hit) continue;
+          const hw = o.w * 0.72;
+          const ob = {
+            x: o.x - hw / 2,
+            y: groundY - o.h + 2,
+            w: hw,
+            h: o.h - 2
+          };
+          if (overlap(box, ob)) {
+            o.hit = true;
+            this.damage(1);
+            break;
+          }
+        }
+
+        if (this.dist >= this.target) {
+          this.finished = true;
+          this.dist = this.target;
+          this.py = groundY;
+          completeLevel('第一关完成', '你穿过赤沙荒原，公共墓地的十字架已在眼前。');
+        }
+      },
+
+      damage(n) {
+        if (this.invuln > 0 || G.state !== 'play') return;
+        this.hp -= n;
+        this.invuln = 1.5;
+        this.hitFlash = 0.18;
+        G.shake = 12;
+        G.flash = 0.3;
+        G.flashColor = '255,245,218';
+        Sfx.hurt();
+        addParticles(this.px, this.py - 34, C.bone, 12, 130, 0.6, 3, 280);
+        addParticles(this.px, this.py - 15, '#6b5d45', 9, 90, 0.55, 3, 240);
+        setToast('被撞倒了！生命 -1', 1.3);
+        if (this.hp <= 0) {
+          this.hp = 0;
+          killPlayer('你倒在了赤沙荒原，风沙掩埋了脚印……');
+        }
+      },
+
+      draw() {
+        const p = clamp(this.dist / this.target, 0, 1);
+        drawDesertSky(this.dist, this.runT);
+        drawDuneLayer(this.dist * 0.1 + 80, 355, 66, '#171714', 12);
+        drawDuneLayer(this.dist * 0.22 + 210, 399, 44, '#211e19', 10);
+        // 远处的仙人掌与界碑
+        for (let i = 0; i < 5; i++) {
+          const x = ((i * 257 - this.dist * 0.18) % (W + 260) + W + 260) % (W + 260) - 130;
+          const h = 25 + (i % 3) * 10;
+          rect(x, groundY - 18 - h, 4, h, 'rgba(12,12,10,.65)');
+          rect(x - 7, groundY - 24 - h, 9, 3, 'rgba(12,12,10,.65)');
+          rect(x - 7, groundY - 24 - h, 3, 10, 'rgba(12,12,10,.65)');
+        }
+        const cp = clamp((this.dist / this.target - 0.52) / 0.26, 0, 1);
+        if (cp > 0) {
+          drawCemeterySilhouette(440 + (1 - cp) * 260, groundY - 2, cp * 0.82);
+        }
+        drawGroundTexture(this.dist, groundY);
+        // 地面上的风滚草
+        for (const tw of this.tumble) {
+          drawTumbleweed(tw.x, tw.y, tw.r, G.time + tw.x * 0.02, '#5a5242');
+        }
+        for (const o of this.obstacles) {
+          if (o.type === 0) drawCactus(o.x, groundY, o.seed);
+          else if (o.type === 1) drawSmallRock(o.x, groundY, o.seed);
+          else drawBigRock(o.x, groundY, o.seed);
+        }
+
+        const blink = this.invuln > 0 && Math.floor(G.time * 18) % 2 === 0;
+        drawHero(this.px, this.py, 1, this.runT, {
+          moving: this.grounded,
+          tint: this.hitFlash > 0 || blink ? C.white : null
+        });
+
+        drawLevel1Progress(p);
+
+        if (G.stateTime < 8 && G.state !== 'levelclear') {
+          const a = clamp((8 - G.stateTime) / 2, 0, 1);
+          ctx.globalAlpha = a;
+          drawBracketPanel(W / 2 - 208, 20, 416, 38);
+          text('空格 / ↑ 跳跃      A D 微调奔跑位置', W / 2, 44, 14, C.bone, 'center');
+          ctx.globalAlpha = 1;
+        }
+      }
+    };
+    return lv;
+  }
+
+  function drawDesertSky(scroll, t) {
+    const grad = ctx.createLinearGradient(0, 0, 0, VH);
+    grad.addColorStop(0, '#0e1012');
+    grad.addColorStop(0.42, '#1b1a17');
+    grad.addColorStop(0.74, '#30291d');
+    grad.addColorStop(1, '#3a3021');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, VH);
+
+    // 昏黄的太阳与光晕
+    ctx.globalAlpha = 0.15;
+    pixelCircle(772, 124, 68, C.gold, 6);
+    ctx.globalAlpha = 0.28;
+    pixelCircle(772, 124, 49, '#b08a3c', 5);
+    ctx.globalAlpha = 0.78;
+    pixelCircle(772, 124, 36, '#8d6b2c', 4);
+    ctx.globalAlpha = 0.28;
+    rect(0, 302, W, 1, '#a27b37');
+    rect(0, 306, W, 1, '#5a4826');
+    ctx.globalAlpha = 1;
+
+    // 云层
+    for (let i = 0; i < 5; i++) {
+      const x = ((i * 233 - t * (4 + i * 0.8) - scroll * 0.03) % (W + 360) + W + 360) % (W + 360) - 180;
+      const y = 76 + (i * 43) % 112;
+      ctx.globalAlpha = 0.22;
+      rect(x, y, 120 + i * 28, 5, '#3a3832');
+      rect(x + 28, y - 5, 82 + i * 14, 5, '#34322c');
+      ctx.globalAlpha = 1;
+    }
+    // 飞鸟
+    ctx.globalAlpha = 0.5;
+    for (let i = 0; i < 3; i++) {
+      const bx = ((t * (9 + i * 2) + i * 170) % (W + 120)) - 60;
+      const by = 92 + i * 21 + Math.sin(t + i) * 4;
+      rect(bx, by, 4, 1, '#181714');
+      rect(bx - 4, by - 2, 4, 1, '#181714');
+      rect(bx + 4, by - 2, 4, 1, '#181714');
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCactus(x, footY, seed = 0) {
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.fillRect(Math.round(x - 15), Math.round(footY - 2), 32, 4);
+    rect(x - 5, footY - 51, 10, 51, '#1a1f18');
+    rect(x - 2, footY - 49, 3, 42, '#2b3126');
+    rect(x - 14, footY - 35, 10, 7, '#1a1f18');
+    rect(x - 14, footY - 35, 5, 18, '#1a1f18');
+    rect(x - 12, footY - 33, 2, 12, '#293025');
+    rect(x + 4, footY - 43, 11, 6, '#1a1f18');
+    rect(x + 11, footY - 43, 5, 20, '#1a1f18');
+    rect(x + 12, footY - 41, 2, 14, '#252b21');
+    rect(x - 1, footY - 53, 2, 5, '#2d3225');
+    rect(x + 9, footY - 46, 2, 2, '#5d5135');
+    rect(x - 11, footY - 31, 2, 2, '#4d432e');
+    if (seed > 0.55) rect(x + 1, footY - 55, 3, 2, '#7b6130');
+  }
+
+  function drawSmallRock(x, footY, seed = 0) {
+    ctx.fillStyle = 'rgba(0,0,0,.42)';
+    ctx.fillRect(x - 20, footY - 2, 42, 4);
+    ctx.fillStyle = '#25231f';
+    ctx.beginPath();
+    ctx.moveTo(x - 18, footY);
+    ctx.lineTo(x - 14, footY - 15);
+    ctx.lineTo(x - 6, footY - 23);
+    ctx.lineTo(x + 7, footY - 21);
+    ctx.lineTo(x + 17, footY - 10);
+    ctx.lineTo(x + 19, footY);
+    ctx.closePath();
+    ctx.fill();
+    rect(x - 12, footY - 16, 14, 4, '#38342c');
+    rect(x - 5, footY - 20, 8, 3, '#454037');
+    rect(x - 2, footY - 11, 3, 6, '#131210');
+    if (seed > 0.6) rect(x + 9, footY - 8, 3, 2, '#4b4232');
+  }
+
+  function drawBigRock(x, footY, seed = 0) {
+    ctx.fillStyle = 'rgba(0,0,0,.5)';
+    ctx.fillRect(x - 34, footY - 2, 68, 5, '#000');
+    ctx.fillStyle = '#1d1c19';
+    ctx.beginPath();
+    ctx.moveTo(x - 29, footY);
+    ctx.lineTo(x - 25, footY - 24);
+    ctx.lineTo(x - 14, footY - 37);
+    ctx.lineTo(x + 6, footY - 40);
+    ctx.lineTo(x + 22, footY - 27);
+    ctx.lineTo(x + 29, footY - 8);
+    ctx.lineTo(x + 26, footY);
+    ctx.closePath();
+    ctx.fill();
+    rect(x - 19, footY - 29, 23, 5, '#34312a');
+    rect(x - 8, footY - 35, 17, 4, '#403c33');
+    rect(x + 8, footY - 21, 14, 4, '#2b2924');
+    rect(x - 6, footY - 19, 3, 13, '#0c0c0a');
+    rect(x - 5, footY - 10, 10, 2, '#0c0c0a');
+    if (seed > 0.5) rect(x + 17, footY - 12, 4, 2, '#5a503b');
+  }
+
+  function drawLevel1Progress(p) {
+    const x = 26, y = VH - 13, w = W - 52;
+    ctx.globalAlpha = 0.92;
+    rect(x, y, w, 7, 'rgba(4,4,3,.8)');
+    rect(x + 1, y + 1, (w - 2) * p, 5, C.gold);
+    rect(x + 1, y + 1, (w - 2) * p, 1, C.goldBright);
+    for (let i = 1; i < 5; i++) rect(x + (w / 5) * i, y - 1, 1, 9, '#5c4a22');
+    ctx.globalAlpha = 1;
+    text('距公共墓地', x, y - 5, 10, '#b9ad91');
+    text(p >= 1 ? '已抵达' : `${Math.floor(p * 100)}%`, x + w, y - 5, 10, C.goldBright, 'right');
+    const gx = x + w - 3;
+    rect(gx, y - 13, 3, 8, '#8f8876');
+    rect(gx - 4, y - 14, 11, 2, '#8f8876');
+  }
+
+
+
+  // ============================================================
+  // 第二关：南北战争·石桥战场
+  // ============================================================
+  function createLevel2() {
+    const bridgeY = 330;
+    const centerX = 480;
+    const crateX = 118;
+    const safeX = 842;
+    const lv = {
+      hp: 3,
+      maxHp: 3,
+      px: 58,
+      py: bridgeY,
+      vy: 0,
+      grounded: true,
+      facing: 1,
+      invuln: 0,
+      hitFlash: 0,
+      runT: 0,
+      hasDynamite: false,
+      placed: false,
+      blown: false,
+      success: false,
+      fuse: 4.5,
+      ending: 0,
+      cleared: false,
+      cannonT: 2.4,
+      cannonFlash: 0,
+      warnings: [],
+      blasts: [],
+      covers: [
+        { x: 300, seed: 0.2 },
+        { x: 610, seed: 0.55 },
+        { x: 748, seed: 0.81 }
+      ],
+
+      updateVisuals(dt) {
+        this.invuln = Math.max(0, this.invuln - dt);
+        this.hitFlash = Math.max(0, this.hitFlash - dt);
+        this.cannonFlash = Math.max(0, this.cannonFlash - dt);
+        for (let i = this.blasts.length - 1; i >= 0; i--) {
+          this.blasts[i].t += dt;
+          if (this.blasts[i].t >= this.blasts[i].life) this.blasts.splice(i, 1);
+        }
+      },
+
+      update(dt) {
+        this.runT += dt;
+        this.updateVisuals(dt);
+
+        if (this.ending > 0) {
+          this.ending -= dt;
+          if (this.ending <= 0 && !this.cleared) {
+            this.cleared = true;
+            completeLevel('第二关完成', '石桥在身后崩塌，你沿着河谷消失在硝烟里。');
+          }
+          return;
+        }
+
+        let move = 0;
+        if (Input.isDown('left')) { move -= 1; this.facing = -1; }
+        if (Input.isDown('right')) { move += 1; this.facing = 1; }
+        this.px = clamp(this.px + move * 198 * dt, 22, 932);
+
+        if ((Input.hit('space') || Input.hit('up')) && this.grounded) {
+          this.vy = -420;
+          this.grounded = false;
+          Sfx.jump();
+        }
+        if (!this.grounded) {
+          this.vy += 1380 * dt;
+          this.py += this.vy * dt;
+          if (this.py >= bridgeY) {
+            this.py = bridgeY;
+            this.vy = 0;
+            this.grounded = true;
+            Sfx.land();
+          }
+        }
+
+        if (Input.hit('interact')) this.interact();
+
+        if (this.hasDynamite && !this.blown) {
+          this.cannonT -= dt;
+          if (this.cannonT <= 0 && this.warnings.length < 2 && !this.placed) {
+            this.spawnWarning();
+            this.cannonT = rand(2.7, 4.1);
+          } else if (this.cannonT <= 0 && this.warnings.length < 2) {
+            this.spawnWarning();
+            this.cannonT = rand(1.9, 2.9);
+          }
+        }
+
+        for (let i = this.warnings.length - 1; i >= 0; i--) {
+          const w = this.warnings[i];
+          w.t += dt;
+          if (w.t >= w.dur) {
+            this.detonate(w.x);
+            this.warnings.splice(i, 1);
+          }
+        }
+
+        if (this.placed && !this.blown) {
+          this.fuse -= dt;
+          if (this.fuse <= 0) this.blowUp();
+        }
+      },
+
+      interact() {
+        if (this.blown || this.ending > 0) return;
+        if (!this.hasDynamite) {
+          if (Math.abs(this.px - crateX) < 66) {
+            this.hasDynamite = true;
+            this.cannonT = 1.35;
+            Sfx.pickup();
+            setToast('拿到炸药箱！去桥中央按 E 放置', 2.4);
+            addParticles(crateX, bridgeY - 20, C.gold, 10, 100, 0.7, 2, 280);
+          } else {
+            setToast('左侧的炸药箱才能炸开桥面', 1.3);
+          }
+          return;
+        }
+        if (!this.placed) {
+          if (Math.abs(this.px - centerX) < 68) {
+            this.placed = true;
+            this.fuse = 4.6;
+            this.cannonT = 1.6;
+            Sfx.place();
+            setToast('引信已点燃！跑向右侧安全区！', 2.6);
+            addParticles(centerX, bridgeY - 8, C.goldBright, 12, 110, 0.65, 2, 260);
+          } else {
+            setToast('把炸药放在桥中央，按 E', 1.3);
+          }
+        }
+      },
+
+      spawnWarning() {
+        const tx = clamp(this.px + rand(-45, 135), 245, 812);
+        this.warnings.push({ x: tx, t: 0, dur: 1.22, r: 72 });
+        this.cannonFlash = 0.2;
+        Sfx.warn();
+      },
+
+      detonate(x) {
+        this.blasts.push({ x, t: 0, life: 0.62, big: false });
+        this.cannonFlash = 0.24;
+        G.shake = Math.max(G.shake, 14);
+        G.flash = 0.18;
+        G.flashColor = '255,205,140';
+        Sfx.boom();
+        addParticles(x, bridgeY - 12, '#84714e', 20, 190, 0.75, 4, 420);
+        addParticles(x, bridgeY - 15, C.gold, 8, 130, 0.55, 3, 300);
+        const behind = this.grounded && this.covers.some(c => Math.abs(this.px - c.x) < 50);
+        if (Math.abs(this.px - x) < 92) {
+          if (behind) {
+            setToast('石掩体挡住了炮火', 1.1);
+          } else {
+            this.damage(1);
+          }
+        }
+      },
+
+      blowUp() {
+        this.blown = true;
+        this.fuse = 0;
+        this.warnings.length = 0;
+        this.blasts.push({ x: centerX, t: 0, life: 1.05, big: true });
+        G.shake = 24;
+        G.flash = 0.5;
+        G.flashColor = '255,214,150';
+        Sfx.boom();
+        addParticles(centerX, bridgeY - 10, C.goldBright, 46, 310, 1.15, 5, 380);
+        addParticles(centerX, bridgeY - 18, '#8b7757', 30, 250, 1.2, 4, 420);
+        if (this.px >= safeX) {
+          this.success = true;
+          this.ending = 1.4;
+          setToast('爆炸成功！你撤到了安全区', 2.2);
+        } else {
+          this.hp = 0;
+          killPlayer('你没跑出爆炸范围，石桥和秘密一起塌进了峡谷……');
+        }
+      },
+
+      damage(n) {
+        if (this.invuln > 0 || G.state !== 'play') return;
+        this.hp -= n;
+        this.invuln = 1.35;
+        this.hitFlash = 0.17;
+        G.shake = Math.max(G.shake, 13);
+        G.flash = 0.3;
+        G.flashColor = '255,235,205';
+        Sfx.hurt();
+        addParticles(this.px, this.py - 34, C.bone, 12, 140, 0.65, 3, 300);
+        setToast('被炮弹击中！生命 -1', 1.3);
+        if (this.hp <= 0) {
+          this.hp = 0;
+          killPlayer('炮火把你掀进了峡谷，河水卷走了所有声音……');
+        }
+      },
+
+      draw() {
+        drawBattlefield(this.runT, this.cannonFlash, this.warnings.length > 0);
+        drawCanyon(this.runT);
+        drawStoneBridge(this.runT);
+
+        // 右侧安全区
+        ctx.globalAlpha = 0.1 + Math.sin(this.runT * 5) * 0.025;
+        rect(safeX, 246, 105, bridgeY - 246, C.gold);
+        ctx.globalAlpha = 0.22;
+        for (let sy = 254; sy < bridgeY; sy += 12) rect(safeX + 6, sy, 93, 1, C.goldDark);
+        ctx.globalAlpha = 1;
+        rect(safeX, 246, 2, bridgeY - 246, C.goldDark);
+        rect(safeX, 246, 105, 1, C.goldDark);
+        rect(safeX + 103, 246, 2, bridgeY - 246, C.goldDark);
+        rect(891, 266, 2, 64, '#222019');
+        rect(893, 266, 28, 18, C.goldDark);
+        rect(896, 269, 22, 12, '#17150f');
+        text('安全区', 907, 279, 9, C.goldBright, 'center');
+
+        if (!this.hasDynamite) drawCrate(crateX, bridgeY, this.px);
+        if (this.placed && !this.blown) drawDynamite(centerX, bridgeY, this.fuse, this.runT);
+
+        // 炮火预警
+        for (const w of this.warnings) {
+          const a = w.t / w.dur;
+          const pulse = 0.5 + Math.sin(w.t * 22) * 0.5;
+          ctx.save();
+          ctx.globalAlpha = 0.25 + pulse * 0.25;
+          ctx.fillStyle = C.redDark;
+          ctx.beginPath();
+          ctx.ellipse(w.x, bridgeY - 4, w.r, 18, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.globalAlpha = 0.7;
+          ctx.strokeStyle = C.red;
+          ctx.lineWidth = 3;
+          ctx.setLineDash([9, 6]);
+          ctx.beginPath();
+          ctx.ellipse(w.x, bridgeY - 4, w.r * (0.72 + a * 0.28), 18, 0, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1;
+          rect(w.x - 2, bridgeY - 47, 4, 14, C.red);
+          rect(w.x - 2, bridgeY - 31, 4, 3, C.red);
+          ctx.restore();
+        }
+
+        const blink = this.invuln > 0 && Math.floor(G.time * 18) % 2 === 0;
+        drawHero(this.px, this.py, this.facing, this.runT, {
+          moving: Math.abs(this.px - 58) > 2 && this.grounded && this.ending <= 0,
+          carry: this.hasDynamite && !this.placed,
+          tint: this.hitFlash > 0 || blink ? C.white : null
+        });
+
+        for (const c of this.covers) drawStoneCover(c.x, bridgeY, c.seed, this.px);
+
+        for (const b of this.blasts) drawBlast(b, bridgeY);
+
+        if (G.state === 'play') this.drawMissionUI();
+      },
+
+      drawMissionUI() {
+        let task, color = C.bone;
+        if (!this.hasDynamite) {
+          task = '目标：走到左侧炸药箱旁，按 E 拾取';
+        } else if (!this.placed) {
+          task = '目标：穿过炮火抵达桥中央，按 E 放置炸药';
+          color = C.goldBright;
+        } else if (!this.blown) {
+          task = `引信 ${Math.max(0, this.fuse).toFixed(1)} 秒 · 冲向右侧安全区！`;
+          color = C.goldBright;
+        } else {
+          task = this.success ? '爆炸成功 · 已抵达安全区' : '……';
+          color = C.goldBright;
+        }
+        drawBracketPanel(W / 2 - 270, 16, 540, 40);
+        text(task, W / 2, 42, 14, color, 'center');
+        if (this.warnings.length > 0) {
+          text('红色落点预警 · 躲到石掩体后！', W / 2, 73, 12, '#d06a58', 'center');
+        } else if (G.stateTime < 9) {
+          ctx.globalAlpha = clamp((9 - G.stateTime) / 2, 0, 1) * 0.78;
+          text('A / D 移动   空格 / ↑ 跳跃   E 互动   石掩体可挡炮火', W / 2, 73, 11, '#b7aa8c', 'center');
+          ctx.globalAlpha = 1;
+        }
+
+        if (!this.hasDynamite && Math.abs(this.px - crateX) < 66) {
+          text('E  拾取炸药', crateX, bridgeY - 82, 13, C.goldBright, 'center');
+        }
+        if (this.hasDynamite && !this.placed && Math.abs(this.px - centerX) < 68) {
+          text('E  在桥中央放置炸药', centerX, bridgeY - 88, 13, C.goldBright, 'center');
+        }
+
+        if (this.placed && !this.blown) {
+          ctx.globalAlpha = 0.9;
+          pixelCircle(centerX, bridgeY - 11, 28 + Math.sin(this.runT * 12) * 4, 'rgba(184,58,49,.06)', 4);
+          ctx.globalAlpha = 1;
+        }
+
+        if (this.success) {
+          drawBracketPanel(W / 2 - 132, 128, 264, 56, C.gold, 'rgba(8,7,5,.86)');
+          text('撤离成功', W / 2, 155, 24, C.goldBright, 'center');
+          text('石桥即将崩塌', W / 2, 174, 11, C.bone, 'center');
+        }
+      }
+    };
+    return lv;
+  }
+
+  function drawBattlefield(t, cannonFlash, alert) {
+    const grad = ctx.createLinearGradient(0, 0, 0, 360);
+    grad.addColorStop(0, '#0a0d10');
+    grad.addColorStop(0.55, '#1a1b19');
+    grad.addColorStop(1, '#2d281e');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, 360);
+
+    ctx.globalAlpha = 0.24;
+    pixelCircle(792, 84, 52, '#91866e', 5);
+    ctx.globalAlpha = 0.32;
+    pixelCircle(792, 84, 35, '#b3a78c', 4);
+    ctx.globalAlpha = 1;
+
+    // 远山与树线
+    ctx.fillStyle = '#151715';
+    ctx.beginPath();
+    ctx.moveTo(0, 292);
+    for (let x = 0; x <= W; x += 40) {
+      const y = 292 - Math.sin(x / 140) * 20 - Math.sin(x / 53) * 6;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(W, 360); ctx.lineTo(0, 360); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#1e1e1a';
+    for (let i = 0; i < 12; i++) {
+      const x = i * 88 + 21;
+      const h = 14 + (i % 4) * 5;
+      rect(x, 291 - h, 4, h, '#10110f');
+      rect(x - 5, 291 - h + 5, 13, 3, '#10110f');
+    }
+
+    // 远处战场烟柱、旗帜
+    ctx.globalAlpha = 0.35;
+    for (let i = 0; i < 4; i++) {
+      const x = 70 + i * 56;
+      const rise = (t * 9 + i * 19) % 92;
+      ctx.fillStyle = '#4a463d';
+      ctx.fillRect(x + Math.sin(t + i) * 5, 290 - rise, 13 + (i % 2) * 8, 19 + rise * 0.5);
+    }
+    ctx.globalAlpha = 1;
+    rect(191, 238, 2, 56, '#1a1915');
+    rect(193, 240, 25, 14, '#2d2418');
+    rect(193, 240, 25, 2, '#5c4824');
+    rect(452, 254, 2, 41, '#191814');
+    rect(454, 255, 20, 11, '#33291b');
+
+    // 炮位剪影
+    function cannon(x, y, flip) {
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(flip, 1);
+      rect(-13, -8, 26, 7, '#11100e');
+      rect(7, -12, 20, 5, '#11100e');
+      rect(23, -13, 9, 4, '#11100e');
+      rect(-11, -1, 5, 1, '#11100e');
+      pixelCircle(-8, 0, 6, '#141310', 3);
+      pixelCircle(8, 0, 6, '#141310', 3);
+      ctx.restore();
+    }
+    cannon(900, 303, -1);
+    cannon(79, 308, 1);
+
+    if (cannonFlash > 0) {
+      const a = clamp(cannonFlash / 0.24, 0, 1);
+      ctx.globalAlpha = a;
+      pixelCircle(878, 286, 20, C.goldBright, 4);
+      pixelCircle(878, 286, 10, '#fff1bb', 3);
+      for (let i = 0; i < 4; i++) {
+        rect(860 - i * 13 - cannonFlash * 80, 281 + (i % 2) * 5, 13, 4, 'rgba(150,140,118,.5)');
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    if (alert) {
+      const a = 0.7 + Math.sin(t * 18) * 0.3;
+      ctx.globalAlpha = a;
+      text('炮 击', 872, 115, 16, C.red, 'center');
+      ctx.globalAlpha = 1;
+      rect(884, 120, 2, 2, C.red);
+    }
+
+    // 硝烟云
+    for (let i = 0; i < 5; i++) {
+      const x = ((i * 233 - t * 5) % (W + 300) + W + 300) % (W + 300) - 150;
+      ctx.globalAlpha = 0.13;
+      rect(x, 120 + (i % 3) * 38, 95, 6, '#676055');
+      rect(x + 20, 114 + (i % 3) * 38, 55, 7, '#555046');
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawCanyon(t) {
+    // 峡谷崖壁
+    ctx.fillStyle = '#11110f';
+    ctx.beginPath();
+    ctx.moveTo(0, 346);
+    ctx.lineTo(52, 346); ctx.lineTo(76, 377); ctx.lineTo(79, 412);
+    ctx.lineTo(58, 484); ctx.lineTo(0, 484);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(W, 346);
+    ctx.lineTo(908, 346); ctx.lineTo(884, 377); ctx.lineTo(886, 418);
+    ctx.lineTo(912, 484); ctx.lineTo(W, 484);
+    ctx.closePath(); ctx.fill();
+    rect(9, 375, 24, 3, '#27231d');
+    rect(20, 403, 25, 2, '#24211b');
+    rect(919, 390, 22, 3, '#26231d');
+
+    // 峡谷深处
+    rect(0, 350, W, VH - 350, '#0c0e0e');
+    ctx.fillStyle = '#131a1b';
+    ctx.beginPath();
+    ctx.moveTo(0, 414);
+    ctx.lineTo(110, 404); ctx.lineTo(250, 422); ctx.lineTo(410, 407);
+    ctx.lineTo(590, 426); ctx.lineTo(760, 405); ctx.lineTo(900, 421);
+    ctx.lineTo(W, 412); ctx.lineTo(W, 484); ctx.lineTo(0, 484);
+    ctx.closePath(); ctx.fill();
+
+    // 河水
+    rect(0, 430, W, VH - 430, '#172224');
+    rect(0, 430, W, 3, '#2a393b');
+    ctx.globalAlpha = 0.6;
+    for (let i = 0; i < 17; i++) {
+      const x = ((i * 89 + t * (17 + (i % 3) * 9)) % (W + 140)) - 70;
+      const y = 438 + (i * 13) % 38;
+      rect(x, y, 16 + (i % 4) * 9, 1, i % 3 === 0 ? '#40565a' : '#26393c');
+    }
+    ctx.globalAlpha = 1;
+    // 河中黑石
+    ctx.fillStyle = '#0c0c0b';
+    ctx.beginPath();
+    ctx.moveTo(186, 472); ctx.lineTo(198, 453); ctx.lineTo(219, 458);
+    ctx.lineTo(225, 476); ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(676, 466); ctx.lineTo(694, 450); ctx.lineTo(714, 462);
+    ctx.lineTo(710, 478); ctx.closePath(); ctx.fill();
+    rect(195, 462, 12, 2, '#2c302d');
+    rect(688, 459, 13, 2, '#2b2f2c');
+
+    // 桥下阴影
+    ctx.globalAlpha = 0.5;
+    rect(70, 353, W - 140, 16, '#080908');
+    ctx.globalAlpha = 1;
+  }
+
+  function drawStoneBridge(t) {
+    const deckY = 330;
+    // 桥墩
+    for (const x of [120, 360, 600, 840]) {
+      rect(x - 21, 352, 42, 118, '#141310');
+      rect(x - 16, 356, 32, 105, '#1d1b17');
+      rect(x - 11, 361, 22, 92, '#25221c');
+      for (let y = 365; y < 448; y += 18) {
+        rect(x - 17, y, 34, 1, '#0b0b09');
+        rect(x - 10, y + 3, 20, 1, '#302b23');
+      }
+      rect(x - 25, 446, 50, 8, '#10100e');
+      rect(x - 28, 454, 56, 6, '#090908');
+    }
+    // 桥拱暗影
+    ctx.strokeStyle = '#090908';
+    ctx.lineWidth = 13;
+    for (let i = 0; i < 3; i++) {
+      const x = 360 + i * 240;
+      ctx.beginPath();
+      ctx.arc(x, 406, 76, Math.PI, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    // 桥面
+    rect(46, deckY, W - 92, 5, '#584c35');
+    rect(46, deckY + 5, W - 92, 17, '#1c1a16');
+    rect(46, deckY + 21, W - 92, 4, '#0b0b09');
+    for (let x = 52; x < W - 52; x += 30) {
+      rect(x, deckY + 5, 1, 16, '#100f0d');
+      rect(x + 5, deckY + 6, 16, 1, '#2e2921');
+    }
+    // 后侧栏杆
+    rect(48, 292, W - 96, 3, '#161512');
+    for (let x = 68; x < W - 60; x += 84) {
+      rect(x, 292, 3, 38, '#12110f');
+      rect(x + 2, 295, 1, 32, '#2c2820');
+    }
+
+    // 桥面磨损与血迹
+    ctx.globalAlpha = 0.4;
+    rect(446, 338, 68, 1, '#5d4a2b');
+    rect(415, 344, 6, 2, '#443a2a');
+    rect(552, 340, 16, 1, '#413729');
+    ctx.globalAlpha = 1;
+
+    // 桥中央标记
+    ctx.globalAlpha = 0.5;
+    rect(460, 326, 40, 2, C.goldDark);
+    rect(478, 319, 4, 7, C.goldDark);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawCrate(x, footY, playerX) {
+    const near = Math.abs(playerX - x) < 66;
+    ctx.fillStyle = 'rgba(0,0,0,.45)';
+    ctx.fillRect(x - 24, footY - 2, 48, 5, '#000');
+    rect(x - 19, footY - 30, 38, 30, '#2d271d');
+    rect(x - 19, footY - 30, 38, 3, '#514329');
+    rect(x - 16, footY - 27, 32, 24, '#242018');
+    rect(x - 14, footY - 25, 28, 2, '#3e3422');
+    rect(x - 14, footY - 8, 28, 2, '#3e3422');
+    rect(x - 3, footY - 29, 6, 29, '#181510');
+    text('TNT', x, footY - 12, 10, near ? C.goldBright : C.goldDark, 'center');
+    if (near) {
+      const pulse = 0.55 + Math.sin(G.time * 7) * 0.45;
+      ctx.globalAlpha = pulse;
+      rect(x - 22, footY - 34, 44, 1, C.gold);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawDynamite(x, footY, fuse, t) {
+    ctx.fillStyle = 'rgba(0,0,0,.42)';
+    ctx.fillRect(x - 22, footY - 2, 44, 5, '#000');
+    rect(x - 15, footY - 17, 30, 7, '#25211b');
+    for (let i = 0; i < 3; i++) {
+      rect(x - 13 + i * 9, footY - 25, 7, 20, i === 1 ? '#3a3021' : '#2a2319');
+      rect(x - 13 + i * 9, footY - 25, 7, 2, '#5c4b2c');
+      rect(x - 11 + i * 9, footY - 20, 3, 10, '#15120e');
+    }
+    rect(x - 16, footY - 19, 33, 3, '#0e0d0b');
+    rect(x - 15, footY - 12, 30, 2, '#0e0d0b');
+    const spark = 0.5 + Math.sin(t * 26) * 0.5;
+    rect(x + 3, footY - 28, 2, 4, C.goldDark);
+    ctx.globalAlpha = spark;
+    rect(x + 2, footY - 31, 3, 3, C.goldBright);
+    rect(x + 5, footY - 33, 2, 2, '#fff1b3');
+    ctx.globalAlpha = 1;
+    drawBracketPanel(x - 29, footY - 61, 58, 25, C.gold, 'rgba(8,7,5,.8)');
+    text(Math.max(0, fuse).toFixed(1), x, footY - 43, 16, fuse < 1.6 && Math.floor(t * 8) % 2 === 0 ? C.red : C.goldBright, 'center');
+  }
+
+  function drawStoneCover(x, footY, seed, playerX) {
+    const near = Math.abs(playerX - x) < 50;
+    ctx.fillStyle = 'rgba(0,0,0,.52)';
+    ctx.fillRect(x - 39, footY - 2, 78, 6, '#000');
+    ctx.fillStyle = '#1e1c18';
+    ctx.beginPath();
+    ctx.moveTo(x - 35, footY);
+    ctx.lineTo(x - 32, footY - 29);
+    ctx.lineTo(x - 22, footY - 45);
+    ctx.lineTo(x + 21, footY - 47);
+    ctx.lineTo(x + 33, footY - 33);
+    ctx.lineTo(x + 36, footY);
+    ctx.closePath(); ctx.fill();
+    rect(x - 23, footY - 39, 35, 4, '#3a352c');
+    rect(x - 12, footY - 45, 28, 3, '#484136');
+    rect(x + 14, footY - 28, 16, 4, '#2d2923');
+    rect(x - 15, footY - 24, 3, 20, '#0b0b0a');
+    rect(x - 14, footY - 11, 12, 2, '#0b0b0a');
+    rect(x + 3, footY - 31, 2, 14, '#11100e');
+    if (seed > 0.5) rect(x + 22, footY - 15, 5, 2, '#514733');
+    if (near) {
+      ctx.globalAlpha = 0.5 + Math.sin(G.time * 5) * 0.16;
+      rect(x - 37, footY - 49, 74, 1, C.goldDark);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function drawBlast(b, footY) {
+    const a = clamp(1 - b.t / b.life, 0, 1);
+    const r = (b.big ? 90 : 52) * (1 - a * 0.2) * (0.5 + b.t / b.life);
+    ctx.save();
+    ctx.globalAlpha = a * 0.75;
+    ctx.fillStyle = b.big ? '#8a6027' : '#6b4023';
+    ctx.beginPath();
+    ctx.arc(b.x, footY - 12, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = C.goldBright;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(b.x, footY - 12, r * 0.75, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.globalAlpha = a * 0.5;
+    ctx.fillStyle = '#211b13';
+    for (let i = 0; i < 7; i++) {
+      const ang = i * 0.9 + b.t * 3;
+      const rr = r * 0.8 + i * 4;
+      ctx.fillRect(b.x + Math.cos(ang) * rr, footY - 25 - Math.sin(ang) * rr * 0.6, 12 + (i % 3) * 4, 8);
+    }
+    ctx.restore();
+  }
+
+  // ============================================================
+  // 第三关：墓园·正午对决
+  // ============================================================
+  function createLevel3() {
+    const footY = 414;
+    const playerX = 300;
+    const enemyX = 660;
+    const lv = {
+      hp: 2,
+      maxHp: 2,
+      playerX,
+      enemyX,
+      py: footY,
+      footY,
+      phase: 'intro',
+      phaseT: 0,
+      waitTime: rand(1.1, 1.9),
+      window: 0.68,
+      round: 1,
+      playerWins: 0,
+      enemyWins: 0,
+      resultText: '',
+      resultSub: '',
+      resultDuration: 1.35,
+      effect: null,
+      playerHitT: 0,
+      enemyHitT: 0,
+      over: false,
+
+      update(dt) {
+        if (this.over) return;
+        this.phaseT += dt;
+        this.playerHitT = Math.max(0, this.playerHitT - dt);
+        this.enemyHitT = Math.max(0, this.enemyHitT - dt);
+        if (this.effect) {
+          this.effect.t += dt;
+          if (this.effect.t > 0.3) this.effect = null;
+        }
+
+        const fire = Input.hit('space') || Input.hit('interact');
+
+        if (this.phase === 'intro') {
+          if (this.phaseT >= 1.0) {
+            this.phase = 'wait';
+            this.phaseT = 0;
+            this.waitTime = rand(1.0, 2.0);
+          }
+        } else if (this.phase === 'wait') {
+          if (this.phaseT >= this.waitTime) {
+            this.phase = 'signal';
+            this.phaseT = 0;
+            Sfx.signal();
+            G.flash = 0.12;
+            G.flashColor = '244,218,150';
+            addParticles(W / 2, 188, C.goldBright, 12, 120, 0.5, 2, 80);
+          } else if (fire) {
+            this.loseRound('你扣扳机太早了！');
+          }
+        } else if (this.phase === 'signal') {
+          if (fire) {
+            this.winRound();
+          } else if (this.phaseT >= this.window) {
+            this.loseRound('你慢了半拍！');
+          }
+        } else if (this.phase === 'result') {
+          if (this.phaseT >= this.resultDuration) {
+            if (this.playerWins >= 2) {
+              this.over = true;
+              triggerWin();
+            } else if (this.enemyWins >= 2) {
+              this.over = true;
+              killPlayer('天使眼的子弹先一步穿过了正午，风带走了你的名字……');
+            } else {
+              this.beginRound();
+            }
+          }
+        }
+      },
+
+      beginRound() {
+        this.round++;
+        this.phase = 'wait';
+        this.phaseT = 0;
+        this.waitTime = rand(1.0, 2.0);
+        this.resultText = '';
+        this.resultSub = '';
+        this.effect = null;
+        this.playerHitT = 0;
+        this.enemyHitT = 0;
+      },
+
+      winRound() {
+        if (this.phase !== 'signal') return;
+        this.playerWins++;
+        this.phase = 'result';
+        this.phaseT = 0;
+        this.resultDuration = 1.35;
+        this.resultText = '命中！';
+        this.resultSub = '你的子弹先到。';
+        this.effect = { owner: 'player', t: 0 };
+        this.enemyHitT = 0.52;
+        Sfx.shoot();
+        G.shake = Math.max(G.shake, 7);
+        addParticles(this.enemyX - 4, this.footY - 48, C.goldBright, 14, 145, 0.62, 3, 280);
+        addParticles(this.enemyX, this.footY - 60, C.bone, 8, 80, 0.55, 2, 160);
+      },
+
+      loseRound(reason) {
+        if (this.phase !== 'wait' && this.phase !== 'signal') return;
+        this.enemyWins++;
+        this.hp = Math.max(0, 2 - this.enemyWins);
+        this.phase = 'result';
+        this.phaseT = 0;
+        this.resultDuration = 1.4;
+        this.resultText = '你中枪了！';
+        this.resultSub = reason;
+        this.effect = { owner: 'enemy', t: 0 };
+        this.playerHitT = 0.55;
+        Sfx.enemyShoot();
+        G.shake = Math.max(G.shake, 12);
+        G.flash = 0.3;
+        G.flashColor = '190,54,44';
+        addParticles(this.playerX + 3, this.footY - 48, C.red, 12, 140, 0.7, 3, 270);
+        addParticles(this.playerX, this.footY - 58, C.bone, 6, 80, 0.5, 2, 140);
+      },
+
+      draw() {
+        drawCemeteryScene(this, false);
+        const pOffset = this.playerHitT > 0 ? Math.sin(G.time * 70) * 2 : 0;
+        const eOffset = this.enemyHitT > 0 ? Math.sin(G.time * 70) * 3 : 0;
+        drawHero(this.playerX + pOffset, this.footY, 1, G.time, {
+          moving: false,
+          gun: true,
+          tint: this.playerHitT > 0 && Math.floor(G.time * 25) % 2 === 0 ? C.white : null
+        });
+        drawAngel(this.enemyX + eOffset, this.footY, G.time, {
+          gun: true,
+          hit: this.enemyHitT > 0,
+          tint: this.enemyHitT > 0 && Math.floor(G.time * 25) % 2 === 0 ? C.white : null
+        });
+        text('你', this.playerX, this.footY - 96, 12, '#b9ad91', 'center');
+        text('天使眼', this.enemyX, this.footY - 102, 13, C.goldBright, 'center');
+        rect(this.enemyX - 19, this.footY - 90, 38, 1, '#4b3b21');
+        this.drawEffect();
+        this.drawDuelUI();
+      },
+
+      drawEffect() {
+        if (!this.effect) return;
+        const e = this.effect;
+        let sx, sy, tx, ty;
+        if (e.owner === 'player') {
+          sx = this.playerX + 25; sy = this.footY - 47;
+          tx = this.enemyX - 6; ty = this.footY - 49;
+        } else {
+          sx = this.enemyX - 25; sy = this.footY - 48;
+          tx = this.playerX + 5; ty = this.footY - 49;
+        }
+        const p = clamp(e.t / 0.22, 0, 1);
+        const color = e.owner === 'player' ? C.goldBright : C.bone;
+        ctx.save();
+        ctx.globalAlpha = 0.24;
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(lerp(sx, tx, p), lerp(sy, ty, p));
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        const bx = lerp(sx, tx, p);
+        const by = lerp(sy, ty, p);
+        rect(bx - 5, by - 1, 10, 3, color);
+        rect(bx - 2, by - 2, 4, 1, '#fff8dd');
+        if (e.t < 0.09) {
+          pixelCircle(sx, sy, 11, color, 3);
+          rect(sx - 15, sy - 2, 30, 3, color);
+          rect(sx - 2, sy - 15, 3, 30, color);
+        }
+        if (e.t > 0.14) {
+          ctx.globalAlpha = clamp(1 - (e.t - 0.14) / 0.15, 0, 1);
+          pixelCircle(tx, ty, 16, color, 3);
+          rect(tx - 22, ty - 2, 8, 3, color);
+          rect(tx + 14, ty - 2, 8, 3, color);
+          rect(tx - 2, ty - 20, 3, 8, color);
+          rect(tx - 2, ty + 12, 3, 8, color);
+          ctx.globalAlpha = 1;
+        }
+        ctx.restore();
+      },
+
+      drawDuelUI() {
+        drawBracketPanel(W / 2 - 148, 16, 296, 52);
+        text(`第 ${this.round} 回合`, W / 2, 33, 10, '#9b8f77', 'center');
+        text(`${this.playerWins}  :  ${this.enemyWins}`, W / 2, 57, 19, C.bone, 'center');
+        text('你', W / 2 - 58, 55, 10, '#9d927e', 'right');
+        text('天使眼', W / 2 + 58, 55, 10, '#9d927e', 'left');
+
+        if (this.phase === 'intro') {
+          drawBracketPanel(W / 2 - 178, 154, 356, 58);
+          text('正午的墓地，风停了……', W / 2, 188, 19, C.bone, 'center');
+        } else if (this.phase === 'wait') {
+          drawBracketPanel(W / 2 - 142, 150, 284, 64);
+          const dots = '.'.repeat(1 + (Math.floor(G.time * 3) % 3));
+          text('等待信号' + dots, W / 2, 183, 22, C.bone, 'center');
+          text('看到「开枪！」再扣扳机', W / 2, 202, 10, '#8f846f', 'center');
+        } else if (this.phase === 'signal') {
+          drawBracketPanel(W / 2 - 177, 134, 354, 104, C.gold, 'rgba(9,7,4,.9)');
+          text('开枪！', W / 2, 191, 46, C.goldBright, 'center');
+          text('空格 / E', W / 2, 217, 12, C.pale, 'center');
+          const remain = clamp(1 - this.phaseT / this.window, 0, 1);
+          rect(W / 2 - 104, 224, 208, 5, '#2d271c');
+          rect(W / 2 - 104, 224, 208 * remain, 5, C.gold);
+          rect(W / 2 - 104, 224, 208 * remain, 1, C.goldBright);
+        } else if (this.phase === 'result') {
+          const good = this.playerWins > this.enemyWins;
+          const col = this.resultText === '命中！' ? C.goldBright : C.red;
+          drawBracketPanel(W / 2 - 172, 148, 344, 78, this.resultText === '命中！' ? C.gold : C.redDark);
+          text(this.resultText, W / 2, 181, 26, col, 'center');
+          text(this.resultSub, W / 2, 207, 12, C.bone, 'center');
+        }
+
+        ctx.globalAlpha = 0.7;
+        text('先赢两回合', W / 2, VH - 28, 11, '#92866e', 'center');
+        ctx.globalAlpha = 1;
+      },
+
+      drawVictory() {
+        drawCemeteryScene(this, true);
+        drawHero(392, this.footY, 1, G.time, { moving: false, gun: false });
+        // 倒下的白帽与外套
+        ctx.save();
+        ctx.globalAlpha = 0.9;
+        ctx.translate(712, this.footY - 10);
+        ctx.rotate(-0.16);
+        rect(-35, 0, 70, 9, '#191714');
+        rect(-25, -8, 58, 9, '#d5cbb2');
+        rect(-9, -17, 30, 9, '#ded5bd');
+        rect(-8, -9, 30, 3, '#171511');
+        rect(-20, 10, 25, 7, '#302b22');
+        ctx.restore();
+
+        drawOpenGrave(520, this.footY, G.time);
+        // 飘起的金色尘屑
+        for (let i = 0; i < 18; i++) {
+          const x = 470 + Math.sin(G.time * 1.4 + i * 1.7) * (28 + (i % 5) * 7);
+          const y = 420 - ((G.time * (18 + i % 6) + i * 21) % 90);
+          ctx.globalAlpha = 0.18 + (i % 4) * 0.12;
+          rect(x, y, 2 + (i % 3), 2 + (i % 3), C.goldBright);
+        }
+        ctx.globalAlpha = 1;
+
+        // 乌鸦盘旋
+        for (let i = 0; i < 3; i++) {
+          const cx = 200 + i * 240 + Math.sin(G.time * 0.8 + i) * 28;
+          const cy = 80 + i * 24 + Math.cos(G.time * 1.1 + i) * 10;
+          drawCrow(cx, cy, G.time + i);
+        }
+      }
+    };
+    return lv;
+  }
+
+  function drawCemeteryScene(lv, victory) {
+    const t = G.time;
+    const grad = ctx.createLinearGradient(0, 0, 0, VH);
+    grad.addColorStop(0, '#08090b');
+    grad.addColorStop(0.42, '#161715');
+    grad.addColorStop(0.78, '#29251c');
+    grad.addColorStop(1, '#332c1f');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, VH);
+
+    // 灰白的正午太阳
+    ctx.globalAlpha = 0.13;
+    pixelCircle(748, 98, 72, '#c0b89f', 6);
+    ctx.globalAlpha = 0.22;
+    pixelCircle(748, 98, 50, '#b6ae96', 4);
+    ctx.globalAlpha = 0.38;
+    pixelCircle(748, 98, 31, '#c9c0a6', 4);
+    ctx.globalAlpha = 1;
+
+    // 云与地平线的薄雾
+    ctx.globalAlpha = 0.25;
+    for (let i = 0; i < 4; i++) {
+      const x = ((i * 279 - t * (3 + i * 0.4)) % (W + 340) + W + 340) % (W + 340) - 170;
+      rect(x, 122 + (i % 3) * 34, 130, 4, '#5a5547');
+      rect(x + 24, 117 + (i % 3) * 34, 72, 4, '#48443a');
+    }
+    ctx.globalAlpha = 1;
+
+    // 远山
+    ctx.fillStyle = '#111310';
+    ctx.beginPath();
+    ctx.moveTo(0, 350);
+    for (let x = 0; x <= W; x += 48) {
+      const y = 350 - Math.sin(x / 170) * 34 - Math.sin(x / 61) * 8;
+      ctx.lineTo(x, y);
+    }
+    ctx.lineTo(W, VH); ctx.lineTo(0, VH); ctx.closePath(); ctx.fill();
+
+    // 远处墓碑十字架
+    ctx.globalAlpha = 0.48;
+    for (let i = 0; i < 13; i++) {
+      const x = 18 + i * 78;
+      const s = 0.42 + (i % 3) * 0.1;
+      drawGrave(x, 397, s, i % 3, 0.48);
+    }
+    ctx.globalAlpha = 1;
+
+    // 枯树
+    drawDeadTree(92, 410, 1);
+    drawDeadTree(872, 407, 0.82);
+
+    // 地面
+    drawGroundTexture(t * 2.5, 414, {
+      top: '#3a3325', body: '#171612', dark: '#0d0c0a', fleck: '#3f392c'
+    });
+    // 墓园泥路与坟包
+    ctx.globalAlpha = 0.6;
+    ctx.fillStyle = '#242019';
+    ctx.beginPath();
+    ctx.ellipse(480, 427, 96, 9, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    rect(460, 420, 42, 2, '#4b3f2b');
+    rect(442, 428, 70, 1, '#332b1f');
+    // 铁栅栏
+    for (let x = 0; x < W; x += 118) {
+      const fenceX = x + 36;
+      rect(fenceX, 328, 2, 58, '#12110e');
+      rect(fenceX - 7, 333, 16, 2, '#12110e');
+      rect(fenceX - 2, 328, 7, 4, '#0e0d0b');
+    }
+
+    // 近景主墓碑
+    drawGrave(174, 424, 1.05, 0, 1);
+    drawGrave(570, 426, 1.15, 1, 1);
+    drawGrave(780, 421, 0.9, 0, 1);
+    drawGrave(902, 430, 1.0, 2, 1);
+    drawGrave(44, 428, 0.82, 1, 1);
+
+    // 中央墓穴
+    if (!victory) {
+      rect(444, 422, 74, 9, '#18130e');
+      rect(450, 430, 62, 5, '#242017');
+      rect(456, 425, 47, 4, '#2e281d');
+      rect(502, 424, 20, 3, '#4c3e25');
+      rect(519, 426, 11, 2, '#1a1610');
+      ctx.globalAlpha = 0.7;
+      rect(478, 432, 5, 2, C.goldDark);
+      rect(489, 429, 3, 2, '#9a772d');
+      ctx.globalAlpha = 1;
+    }
+
+    // 风线
+    ctx.save();
+    for (let i = 0; i < 10; i++) {
+      const y = 42 + i * 39;
+      const speed = 24 + (i % 4) * 13;
+      const x = ((i * 143 + t * speed) % (W + 280)) - 140;
+      const len = 28 + (i % 5) * 18;
+      ctx.globalAlpha = 0.06 + (i % 3) * 0.025;
+      rect(x, y, len, 1, '#d2c6aa');
+      rect(x + len * 0.55, y + 1, len * 0.4, 1, '#b7aa8e');
+    }
+    ctx.globalAlpha = 0.5;
+    text('SAD HILL  ·  CEMETERY', 38, 466, 9, '#6d614c');
+    ctx.restore();
+
+    if (victory) {
+      ctx.globalAlpha = 0.08;
+      rect(0, 0, W, VH, C.gold);
+      ctx.globalAlpha = 1;
+    }
+
+    // 乌鸦
+    for (let i = 0; i < 4; i++) {
+      const cx = ((i * 257 + t * (11 + i * 2)) % (W + 120)) - 60;
+      const cy = 72 + (i * 37) % 122 + Math.sin(t + i) * 5;
+      drawCrow(cx, cy, t + i);
+    }
+  }
+
+  function drawDeadTree(x, baseY, s) {
+    ctx.save();
+    ctx.translate(x, baseY);
+    ctx.scale(s, s);
+    rect(-3, -74, 6, 74, '#0d0c0a');
+    rect(-1, -72, 2, 58, '#25221b');
+    rect(-22, -59, 21, 4, '#0d0c0a');
+    rect(-21, -58, 3, 15, '#0d0c0a');
+    rect(2, -68, 25, 4, '#0d0c0a');
+    rect(22, -67, 3, 13, '#0d0c0a');
+    rect(-12, -82, 3, 22, '#0d0c0a');
+    rect(-9, -79, 18, 3, '#0d0c0a');
+    rect(12, -48, 3, 16, '#0d0c0a');
+    rect(-34, -38, 23, 3, '#0d0c0a');
+    ctx.restore();
+  }
+
+  function drawCrow(x, y, t) {
+    ctx.globalAlpha = 0.72;
+    rect(x - 7, y - 2, 6, 2, '#0b0b0a');
+    rect(x + 1, y - 2, 6, 2, '#0b0b0a');
+    rect(x - 3, y, 2, 2, '#0b0b0a');
+    rect(x + 2, y, 2, 2, '#0b0b0a');
+    rect(x - 9, y - 4 + Math.sin(t * 4) * 1.4, 3, 2, '#0b0b0a');
+    rect(x + 6, y - 4 - Math.sin(t * 4) * 1.4, 3, 2, '#0b0b0a');
+    ctx.globalAlpha = 1;
+  }
+
+  function drawOpenGrave(x, footY, t) {
+    ctx.save();
+    ctx.globalAlpha = 0.95;
+    ctx.fillStyle = '#0a0807';
+    ctx.beginPath();
+    ctx.ellipse(x, footY - 4, 68, 17, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#211b12';
+    ctx.beginPath();
+    ctx.ellipse(x, footY - 2, 58, 12, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    // 外翻的泥土
+    ctx.fillStyle = '#292318';
+    ctx.beginPath();
+    ctx.ellipse(x - 62, footY - 3, 28, 9, -0.3, 0, Math.PI * 2);
+    ctx.ellipse(x + 58, footY - 1, 25, 8, 0.4, 0, Math.PI * 2);
+    ctx.fill();
+    // 金币堆
+    for (let i = 0; i < 30; i++) {
+      const ang = i * 2.4;
+      const r = (i % 7) * 6 + 6;
+      const cx = x + Math.cos(ang) * r;
+      const cy = footY - 12 + Math.sin(ang) * r * 0.36;
+      rect(cx - 4, cy - 2, 8, 4, i % 3 === 0 ? C.goldBright : C.gold);
+      rect(cx - 2, cy - 2, 3, 1, '#fff0b0');
+    }
+    rect(x - 24, footY - 22, 48, 5, '#3a2d18');
+    // 张开的藏宝箱
+    rect(x - 30, footY - 24, 60, 4, '#18140f');
+    rect(x - 25, footY - 29, 50, 5, '#2a2114');
+    rect(x - 25, footY - 29, 50, 1, C.goldDark);
+    // 金色光柱与飘尘
+    ctx.globalAlpha = 0.08 + Math.sin(t * 2) * 0.02;
+    rect(x - 40, 250, 80, footY - 250, C.goldBright);
+    ctx.globalAlpha = 0.25;
+    for (let i = 0; i < 9; i++) {
+      const gx = x - 34 + ((i * 19 + t * 12) % 68);
+      const gy = footY - 20 - ((t * (16 + i) + i * 17) % 100);
+      rect(gx, gy, 2, 2, C.goldBright);
+    }
+    ctx.globalAlpha = 1;
+    text('GOLD', x, footY - 37, 9, C.goldDark, 'center');
+  }
+
+  // ============================================================
+  // 标题、HUD 与总渲染
+  // ============================================================
+  function drawTitleScene() {
+    const t = G.time;
+    drawCemeteryScene({}, false);
+
+    // 标题前的两个剪影
+    ctx.globalAlpha = 0.9;
+    drawHero(351, 457, 1, t, { moving: false, gun: false });
+    drawAngel(676, 457, t, { gun: true, alpha: 0.86 });
+    ctx.globalAlpha = 1;
+
+    const shade = ctx.createLinearGradient(0, 0, 0, VH);
+    shade.addColorStop(0, 'rgba(3,3,3,.88)');
+    shade.addColorStop(0.38, 'rgba(3,3,3,.45)');
+    shade.addColorStop(0.72, 'rgba(3,3,3,.08)');
+    shade.addColorStop(1, 'rgba(3,3,3,.58)');
+    ctx.fillStyle = shade;
+    ctx.fillRect(0, 0, W, VH);
+
+    // 细雨般的金色尘埃
+    for (let i = 0; i < 26; i++) {
+      const x = ((i * 83 + t * (4 + i % 3)) % (W + 30)) - 15;
+      const y = 310 + ((i * 47 + t * (9 + i % 4)) % 150);
+      ctx.globalAlpha = 0.08 + (i % 5) * 0.03;
+      rect(x, y, 2, 2, C.goldBright);
+    }
+    ctx.globalAlpha = 1;
+
+    text('一 部 三 幕 西 部 神 话', W / 2, 86, 12, '#a89b80', 'center');
+    text('墓 中 金 币', W / 2, 158, 62, C.goldBright, 'center');
+    text('G R A V E   G O L D', W / 2, 184, 12, C.gold, 'center', 'normal');
+    rect(W / 2 - 196, 198, 154, 1, C.goldDark);
+    rect(W / 2 + 42, 198, 154, 1, C.goldDark);
+    rect(W / 2 - 210, 196, 9, 5, C.goldDark);
+    rect(W / 2 + 201, 196, 9, 5, C.goldDark);
+    text('一张藏宝图  ·  三座坟  ·  一把左轮', W / 2, 228, 14, C.bone, 'center', 'normal');
+
+    const pulse = 0.58 + Math.sin(t * 3.2) * 0.32;
+    ctx.globalAlpha = pulse;
+    drawBracketPanel(W / 2 - 125, 252, 250, 38, C.gold);
+    text('按  空 格  开 始', W / 2, 278, 18, C.goldBright, 'center');
+    ctx.globalAlpha = 1;
+
+    drawBracketPanel(W / 2 - 316, 311, 632, 61, '#4a3b20', 'rgba(5,5,4,.82)');
+    text('A / D 移动      空格 / ↑ 跳跃      E 互动      R 重开本关', W / 2, 335, 13, C.pale, 'center', 'normal');
+    text('M 静音      死亡后按 R / 空格 重来      三关通关可获墓中金币', W / 2, 358, 11, '#a99b7e', 'center', 'normal');
+    text('提示：金色只留给真正重要的东西。', W / 2, 391, 10, '#756a56', 'center', 'normal');
+  }
+
+  function drawToast() {
+    if (G.toastT <= 0 || !G.toast) return;
+    const a = clamp(G.toastT / 0.35, 0, 1);
+    ctx.globalAlpha = a;
+    drawBracketPanel(W / 2 - 177, 88, 354, 36, C.goldDark, 'rgba(5,5,4,.86)');
+    text(G.toast, W / 2, 112, 13, C.goldBright, 'center');
+    ctx.globalAlpha = 1;
+  }
+
+  function drawFlash() {
+    if (G.flash <= 0) return;
+    const a = clamp(G.flash * 1.8, 0, 0.55);
+    ctx.fillStyle = `rgba(${G.flashColor},${a})`;
+    ctx.fillRect(0, 0, W, VH);
+  }
+
+  function drawHUD() {
+    const m = meta();
+    const hp = level && level.hp != null ? level.hp : m.maxHp;
+    const maxHp = level && level.maxHp != null ? level.maxHp : m.maxHp;
+
+    rect(0, VH, W, HUD_H, '#080806');
+    rect(0, VH, W, 2, '#4a3a20');
+    rect(0, VH + 2, W, 1, '#16130e');
+    rect(0, H - 1, W, 1, '#292218');
+
+    text(`第 ${m.no} 关`, 18, VH + 17, 11, C.gold, 'left');
+    text(m.name, 18, VH + 41, 16, '#e0d5bd', 'left');
+
+    rect(278, VH + 9, 1, HUD_H - 18, '#3b3020');
+    rect(279, VH + 9, 1, HUD_H - 18, '#0c0b08');
+
+    // 发生地点：醒目的金色标牌
+    rect(296, VH + 7, 378, 42, '#121008');
+    rect(296, VH + 7, 378, 1, '#5c4822');
+    rect(296, VH + 48, 378, 1, '#2f2614');
+    rect(296, VH + 7, 2, 42, '#7d6128');
+    rect(302, VH + 17, 8, 8, C.gold);
+    rect(304, VH + 25, 4, 5, C.gold);
+    rect(305, VH + 18, 2, 2, '#17130b');
+    text('发 生 地 点', 320, VH + 21, 9, '#9b8555', 'left', 'normal');
+    text(m.loc, 320, VH + 41, 19, C.goldBright, 'left');
+
+    text('生 命 值', 704, VH + 19, 10, '#a1947b', 'left', 'normal');
+    const hearts = clamp(maxHp, 1, 3);
+    for (let i = 0; i < hearts; i++) {
+      drawHeart(704 + i * 23, VH + 26, i < hp);
+    }
+    text(`M  ${Sfx.muted ? '静音' : '音效开'}`, 850, VH + 20, 10, Sfx.muted ? '#756a55' : '#a99a7b', 'left', 'normal');
+    text('R  重开本关', 850, VH + 39, 10, '#756a55', 'left', 'normal');
+
+    // 底部信息条上的一小段像素刻度
+    const colors = ['#231e14', '#1b1810', '#100e0a'];
+    for (let i = 0; i < 38; i++) {
+      rect(W - 238 + i * 6, VH + 51, 4, 2, colors[i % 3]);
+    }
+  }
+
+  function drawDeadOverlay() {
+    const a = clamp(G.stateTime * 3.5, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(3,2,2,.74)';
+    ctx.fillRect(0, 0, W, VH);
+    drawBracketPanel(W / 2 - 250, 154, 500, 176, '#5d3f25', 'rgba(10,7,5,.92)');
+    text('你 倒 下 了', W / 2, 213, 40, C.red, 'center');
+    text(G.deadReason || '荒野收走了又一个寻宝者。', W / 2, 249, 14, C.bone, 'center', 'normal');
+    const pulse = 0.6 + Math.sin(G.time * 4) * 0.35;
+    ctx.globalAlpha = a * pulse;
+    text('按  R  或  空 格  重 开 本 关', W / 2, 297, 16, C.goldBright, 'center');
+    ctx.globalAlpha = 1;
+  }
+
+  function drawClearOverlay() {
+    const a = clamp(G.stateTime * 3, 0, 1);
+    ctx.globalAlpha = a;
+    ctx.fillStyle = 'rgba(3,3,3,.62)';
+    ctx.fillRect(0, 0, W, VH);
+    drawBracketPanel(W / 2 - 286, 132, 572, 230, C.gold, 'rgba(8,7,5,.93)');
+    text('关 卡 完 成', W / 2, 180, 12, C.gold, 'center');
+    text(G.clearTitle || '关卡完成', W / 2, 221, 34, C.goldBright, 'center');
+    text(G.clearSub || '', W / 2, 252, 13, C.bone, 'center', 'normal');
+    rect(W / 2 - 170, 271, 340, 1, '#4a3b20');
+    const next = G.level < 3 ? LEVELS[G.level] : null;
+    if (next) {
+      text(`下一站  ·  ${next.loc}`, W / 2, 294, 13, '#cdbd9d', 'center', 'normal');
+      text(`第 ${next.no} 关  ${next.name}`, W / 2, 312, 11, '#8d8069', 'center', 'normal');
+    }
+    const pulse = 0.6 + Math.sin(G.time * 3.6) * 0.35;
+    ctx.globalAlpha = a * pulse;
+    text('按  空 格  继 续', W / 2, 345, 17, C.goldBright, 'center');
+    ctx.globalAlpha = 1;
+  }
+
+  function drawWinOverlay() {
+    const t = G.stateTime;
+    const fade = clamp(t * 1.8, 0, 1);
+    ctx.globalAlpha = fade;
+    const g = ctx.createLinearGradient(0, 0, 0, VH);
+    g.addColorStop(0, 'rgba(4,3,2,.8)');
+    g.addColorStop(0.32, 'rgba(4,3,2,.24)');
+    g.addColorStop(0.7, 'rgba(4,3,2,.34)');
+    g.addColorStop(1, 'rgba(4,3,2,.8)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, VH);
+
+    drawBracketPanel(W / 2 - 306, 132, 612, 198, C.gold, 'rgba(7,6,4,.83)');
+    text('GOLD OF THE GRAVE', W / 2, 164, 10, '#9b8657', 'center', 'normal');
+    text('墓 中 的 金 币 属 于 你', W / 2, 222, 37, C.goldBright, 'center');
+    text('萨德希尔公墓 · 正午之后', W / 2, 249, 14, C.bone, 'center', 'normal');
+    rect(W / 2 - 156, 266, 312, 1, '#4d3c20');
+    text('风停了。你带着一整袋黄金，走进下一个传说。', W / 2, 290, 12, '#c7b999', 'center', 'normal');
+
+    const pulse = 0.62 + Math.sin(G.time * 3.4) * 0.34;
+    ctx.globalAlpha = fade * pulse;
+    text('按  R  再 来 一 次      ·      按  空 格  返 回 标 题', W / 2, 319, 13, C.goldBright, 'center');
+    ctx.globalAlpha = 1;
+  }
+
+  function render() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    const shake = G.shake;
+    const sx = shake > 0.3 ? Math.round(rand(-shake, shake)) : 0;
+    const sy = shake > 0.3 ? Math.round(rand(-shake * 0.6, shake * 0.6)) : 0;
+
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    if (G.state === 'title') {
+      drawTitleScene();
+    } else if (G.state === 'win' && level && level.drawVictory) {
+      level.drawVictory();
+    } else if (level) {
+      level.draw();
+    }
+
+    drawParticles();
+    if (G.state === 'win') drawCoins();
+    ctx.restore();
+
+    drawFlash();
+
+    if (G.state === 'play') drawToast();
+    else if (G.state === 'dead') drawDeadOverlay();
+    else if (G.state === 'levelclear') drawClearOverlay();
+    else if (G.state === 'win') drawWinOverlay();
+
+    drawHUD();
+  }
+
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
+
+
+
+
+
